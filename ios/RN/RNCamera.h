@@ -19,6 +19,9 @@
 @property(nonatomic, strong) AVCaptureDeviceInput *audioCaptureDeviceInput;
 @property(nonatomic, strong) AVCaptureStillImageOutput *stillImageOutput;
 @property(nonatomic, strong) AVCaptureMovieFileOutput *movieFileOutput;
+@property(nonatomic, strong) AVAssetWriterInput *videoInputWriter;
+@property(nonatomic, strong) AVAssetWriter *videoWriter;
+@property(nonatomic, copy) NSString *videoPath; // video path
 @property(nonatomic, strong) AVCaptureMetadataOutput *metadataOutput;
 @property(nonatomic, strong) AVCaptureVideoDataOutput *videoDataOutput;
 @property(nonatomic, strong) AVCaptureVideoPreviewLayer *previewLayer;
@@ -100,8 +103,6 @@
 - (void)onFacesDetected:(NSDictionary *)event;
 - (void)onPictureTaken:(NSDictionary *)event;
 - (void)onPictureSaved:(NSDictionary *)event;
-- (void)onRecordingStart:(NSDictionary *)event;
-- (void)onRecordingEnd:(NSDictionary *)event;
 - (void)onText:(NSDictionary *)event;
 - (void)onBarcodesDetected:(NSDictionary *)event;
 - (bool)isRecording;
