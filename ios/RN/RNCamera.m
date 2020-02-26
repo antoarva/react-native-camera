@@ -29,8 +29,6 @@
 @property (nonatomic, copy) RCTDirectEventBlock onGoogleVisionBarcodesDetected;
 @property (nonatomic, copy) RCTDirectEventBlock onPictureTaken;
 @property (nonatomic, copy) RCTDirectEventBlock onPictureSaved;
-@property (nonatomic, copy) RCTDirectEventBlock onRecordingStart;
-@property (nonatomic, copy) RCTDirectEventBlock onRecordingEnd;
 @property (nonatomic, assign) BOOL finishedReadingText;
 @property (nonatomic, assign) BOOL finishedDetectingFace;
 @property (nonatomic, assign) BOOL finishedDetectingBarcodes;
@@ -81,6 +79,9 @@ BOOL _sessionInterrupted = NO;
         self.cameraId = nil;
         self.isFocusedOnPoint = NO;
         self.isExposedOnPoint = NO;
+	self.videoInputWriter = nil;
+        self.videoWriter = nil;
+	self.videoPath = nil;
         _recordRequested = NO;
         _sessionInterrupted = NO;
 
@@ -127,20 +128,6 @@ BOOL _sessionInterrupted = NO;
 {
     if (_onPictureSaved) {
         _onPictureSaved(event);
-    }
-}
-
-- (void)onRecordingStart:(NSDictionary *)event
-{
-    if (_onRecordingStart) {
-        _onRecordingStart(event);
-    }
-}
-
-- (void)onRecordingEnd:(NSDictionary *)event
-{
-    if (_onRecordingEnd) {
-        _onRecordingEnd(event);
     }
 }
 
@@ -983,6 +970,11 @@ BOOL _sessionInterrupted = NO;
 }
 - (void)record:(NSDictionary *)options resolve:(RCTPromiseResolveBlock)resolve reject:(RCTPromiseRejectBlock)reject
 {
+    NSDate * now = [NSDate date];
+            NSDateFormatter *outputFormatter = [[NSDateFormatter alloc] init];
+            [outputFormatter setDateFormat:@"HH:mm:ss.SSS"];
+            NSString *newDateString = [outputFormatter stringFromDate:now];
+            NSLog(@"native start recording: %@", newDateString);
     if(self.videoCaptureDeviceInput == nil || !self.session.isRunning){
         reject(@"E_VIDEO_CAPTURE_FAILED", @"Camera is not ready.", nil);
         return;
@@ -1000,8 +992,16 @@ BOOL _sessionInterrupted = NO;
     // might also call this, only the outermost commit will take effect
     // making the camera changes much faster.
     [self.session beginConfiguration];
+        NSString *path = nil;
+        if (options[@"path"]) {
+            path = options[@"path"];
+        }
+        else {
+            path = [RNFileSystem generatePathInDirectory:[[RNFileSystem cacheDirectoryPath] stringByAppendingPathComponent:@"Camera"] withExtension:@".mov"];
+        }
 
 
+	self.videoPath = path;
     if (_movieFileOutput == nil) {
         // At the time of writing AVCaptureMovieFileOutput and AVCaptureVideoDataOutput (> GMVDataOutput)
         // cannot coexist on the same AVSession (see: https://stackoverflow.com/a/4986032/1123156).
@@ -1015,14 +1015,25 @@ BOOL _sessionInterrupted = NO;
         if ([self.barcodeDetector isRealDetector]) {
             [self stopBarcodeDetection];
         }
-        [self setupMovieFileCapture];
+	[self setupMovieBufferCapture ];
     }
+    
+    [self.videoWriter startWriting];
+    
 
     if (self.movieFileOutput == nil || self.movieFileOutput.isRecording || _videoRecordedResolve != nil || _videoRecordedReject != nil) {
         [self.session commitConfiguration];
       return;
     }
 
+    if (options[@"maxDuration"]) {
+        Float64 maxDuration = [options[@"maxDuration"] floatValue];
+        self.movieFileOutput.maxRecordedDuration = CMTimeMakeWithSeconds(maxDuration, 30);
+    }
+
+    if (options[@"maxFileSize"]) {
+        self.movieFileOutput.maxRecordedFileSize = [options[@"maxFileSize"] integerValue];
+    }
 
     // video preset will be cleanedup/restarted once capture is done
     // with a camera cleanup call
@@ -1040,7 +1051,6 @@ BOOL _sessionInterrupted = NO;
     }
 
     AVCaptureConnection *connection = [self.movieFileOutput connectionWithMediaType:AVMediaTypeVideo];
-
     if (self.videoStabilizationMode != 0) {
         if (connection.isVideoStabilizationSupported == NO) {
             RCTLogWarn(@"%s: Video Stabilization is not supported on this device.", __func__);
@@ -1050,6 +1060,28 @@ BOOL _sessionInterrupted = NO;
     }
     [connection setVideoOrientation:orientation];
 
+    if (options[@"codec"]) {
+        if (@available(iOS 10, *)) {
+            AVVideoCodecType videoCodecType = options[@"codec"];
+            if ([self.movieFileOutput.availableVideoCodecTypes containsObject:videoCodecType]) {
+                self.videoCodecType = videoCodecType;
+                if(options[@"videoBitrate"]) {
+                    NSString *videoBitrate = options[@"videoBitrate"];
+                    [self.movieFileOutput setOutputSettings:@{
+                      AVVideoCodecKey:videoCodecType,
+                      AVVideoCompressionPropertiesKey:
+                          @{
+                              AVVideoAverageBitRateKey:videoBitrate
+                          }
+                      } forConnection:connection];
+                } else {
+                    [self.movieFileOutput setOutputSettings:@{AVVideoCodecKey:videoCodecType} forConnection:connection];
+                }
+            } else {
+                RCTLogWarn(@"%s: Setting videoCodec is only supported above iOS version 10.", __func__);
+            }
+        }
+    }
 
 
     BOOL recordAudio = [options valueForKey:@"mute"] == nil || ([options valueForKey:@"mute"] != nil && ![options[@"mute"] boolValue]);
@@ -1085,52 +1117,6 @@ BOOL _sessionInterrupted = NO;
 
     dispatch_async(self.sessionQueue, ^{
 
-        // session preset might affect this, so we run this code
-        // also in the session queue
-
-        if (options[@"maxDuration"]) {
-            Float64 maxDuration = [options[@"maxDuration"] floatValue];
-            self.movieFileOutput.maxRecordedDuration = CMTimeMakeWithSeconds(maxDuration, 30);
-        }
-
-        if (options[@"maxFileSize"]) {
-            self.movieFileOutput.maxRecordedFileSize = [options[@"maxFileSize"] integerValue];
-        }
-
-        if (options[@"codec"]) {
-            if (@available(iOS 10, *)) {
-                AVVideoCodecType videoCodecType = options[@"codec"];
-                if ([self.movieFileOutput.availableVideoCodecTypes containsObject:videoCodecType]) {
-                    self.videoCodecType = videoCodecType;
-                    if(options[@"videoBitrate"]) {
-                        NSString *videoBitrate = options[@"videoBitrate"];
-                        [self.movieFileOutput setOutputSettings:@{
-                          AVVideoCodecKey:videoCodecType,
-                          AVVideoCompressionPropertiesKey:
-                              @{
-                                  AVVideoAverageBitRateKey:videoBitrate
-                              }
-                          } forConnection:connection];
-                    } else {
-                        [self.movieFileOutput setOutputSettings:@{AVVideoCodecKey:videoCodecType} forConnection:connection];
-                    }
-                } else {
-                    RCTLogWarn(@"Video Codec %@ is not available.", videoCodecType);
-                }
-            }
-            else {
-                RCTLogWarn(@"%s: Setting videoCodec is only supported above iOS version 10.", __func__);
-            }
-        }
-
-
-        NSString *path = nil;
-        if (options[@"path"]) {
-            path = options[@"path"];
-        }
-        else {
-            path = [RNFileSystem generatePathInDirectory:[[RNFileSystem cacheDirectoryPath] stringByAppendingPathComponent:@"Camera"] withExtension:@".mov"];
-        }
 
         if ([options[@"mirrorVideo"] boolValue]) {
             if ([connection isVideoMirroringSupported]) {
@@ -1150,10 +1136,19 @@ BOOL _sessionInterrupted = NO;
         // to ensure the camera already has focus and exposure set.
         double delayInSeconds = 0.5;
         dispatch_time_t popTime = dispatch_time(DISPATCH_TIME_NOW, delayInSeconds * NSEC_PER_SEC);
+       
+        
+	   
+       
+
+
+        
+       
+
 
         // we will use this flag to stop recording
         // if it was requested to stop before it could even start
-        _recordRequested = YES;
+        //_recordRequested = YES;
 
         dispatch_after(popTime, self.sessionQueue, ^(void){
 
@@ -1164,12 +1159,6 @@ BOOL _sessionInterrupted = NO;
                 [self.movieFileOutput startRecordingToOutputFileURL:outputURL recordingDelegate:self];
                 self.videoRecordedResolve = resolve;
                 self.videoRecordedReject = reject;
-
-                [self onRecordingStart:@{
-                    @"uri": outputURL.absoluteString,
-                    @"videoOrientation": @([self.orientation integerValue]),
-                    @"deviceOrientation": @([self.deviceOrientation integerValue])
-                }];
 
             }
             else{
@@ -1185,12 +1174,13 @@ BOOL _sessionInterrupted = NO;
     });
 }
 
+
 - (void)stopRecording
 {
+    [self stopBufferCapture];
     dispatch_async(self.sessionQueue, ^{
         if ([self.movieFileOutput isRecording]) {
             [self.movieFileOutput stopRecording];
-            [self onRecordingEnd:@{}];
         } else {
             if(_recordRequested){
                 _recordRequested = NO;
@@ -1252,7 +1242,7 @@ BOOL _sessionInterrupted = NO;
         // to avoid an exposure rack on some devices that can cause the first few
         // frames of the recorded output to be underexposed.
         if (![self.faceDetector isRealDetector] && ![self.textDetector isRealDetector] && ![self.barcodeDetector isRealDetector]) {
-            [self setupMovieFileCapture];
+            [self setupMovieBufferCapture];
         }
         [self setupOrDisableBarcodeScanner];
 
@@ -1388,7 +1378,7 @@ BOOL _sessionInterrupted = NO;
                 RCTLogWarn(@"Audio device could not set inactive: %s: %@", __func__, error);
             }
         }
-
+        
         self.audioCaptureDeviceInput = nil;
 
         // inform that audio was interrupted
@@ -1492,7 +1482,7 @@ BOOL _sessionInterrupted = NO;
         }
         else{
             RCTLog(@"The selected device does not work with the Preset [%@] or configuration provided", self.session.sessionPreset);
-
+            
             [self onMountingError:@{@"message": @"Camera device does not support selected settings."}];
         }
 
@@ -1715,6 +1705,7 @@ BOOL _sessionInterrupted = NO;
 - (void)captureOutput:(AVCaptureOutput *)captureOutput didOutputMetadataObjects:(NSArray *)metadataObjects
        fromConnection:(AVCaptureConnection *)connection
 {
+
     for(AVMetadataObject *metadata in metadataObjects) {
         if([metadata isKindOfClass:[AVMetadataMachineReadableCodeObject class]]) {
             AVMetadataMachineReadableCodeObject *codeMetadata = (AVMetadataMachineReadableCodeObject *) metadata;
@@ -1791,6 +1782,61 @@ BOOL _sessionInterrupted = NO;
     }
 }
 
+- (void)setupMovieBufferCapture
+{
+
+    AVCaptureSessionPreset preset = [self getDefaultPresetVideo];
+
+    self.session.sessionPreset = preset;
+    if (!self.videoDataOutput) {
+        self.videoDataOutput = [[AVCaptureVideoDataOutput alloc] init];
+        if (![self.session canAddOutput:_videoDataOutput]) {
+            NSLog(@"Failed to setup video data output");
+            [self stopBufferCapture];
+            return;
+        }
+
+        NSDictionary *rgbOutputSettings = [NSDictionary
+            dictionaryWithObject:[NSNumber numberWithInt:kCMPixelFormat_32BGRA]
+                            forKey:(id)kCVPixelBufferPixelFormatTypeKey];
+        [self.videoDataOutput setVideoSettings:rgbOutputSettings];
+        [self.videoDataOutput setAlwaysDiscardsLateVideoFrames:YES];
+        [self.videoDataOutput setSampleBufferDelegate:self queue:self.sessionQueue];
+        [self.session addOutput:_videoDataOutput];
+    }
+    //NSURL *url = [[NSURL alloc] initFileURLWithPath:self.videoPath];
+    AVAssetWriter *assetWriter = [[AVAssetWriter alloc] initWithURL:[NSURL fileURLWithPath:self.videoPath] fileType:AVFileTypeQuickTimeMovie error:nil];
+    //AVAssetWriter *assetWriter = [AVAssetWriter init  assetWriterWithURL:url fileType:AVFileTypeMPEG4 error:nil];
+    AVAssetWriterInput *videoInput = [[AVAssetWriterInput alloc] initWithMediaType:AVMediaTypeVideo outputSettings:nil];
+    self.videoInputWriter = videoInput;
+    self.videoWriter = assetWriter;
+    videoInput.expectsMediaDataInRealTime = YES;
+    if ([assetWriter canAddInput:videoInput]) {
+        [assetWriter addInput:videoInput];
+    }
+}
+
+
+
+- (void)stopBufferCapture
+{
+    NSLog(@"stop buffer");
+   
+    if(_recordRequested){
+        _recordRequested = NO;
+    }
+    [self.videoInputWriter markAsFinished];
+    [self.videoWriter finishWritingWithCompletionHandler:^(void) {NSLog(@"finish writing to a file");} ];
+    if (self.videoDataOutput) {
+           [self.session removeOutput:self.videoDataOutput];
+       }
+       
+    AVCaptureSessionPreset preset = [self getDefaultPreset];
+    if (self.session.sessionPreset != preset) {
+        [self updateSessionPreset: preset];
+    }
+}
+
 - (void)cleanupMovieFileCapture
 {
     if ([_session.outputs containsObject:_movieFileOutput]) {
@@ -1799,8 +1845,63 @@ BOOL _sessionInterrupted = NO;
     }
 }
 
+- (void)captureOutput:(AVCaptureOutput *)output
+didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
+       fromConnection:(AVCaptureConnection *)connection;
+{
+    
+    
+    
+    if (self.videoWriter.status != 0) {
+        CMTime timestamp = CMSampleBufferGetPresentationTimeStamp( sampleBuffer );
+        NSTimeInterval  systemNow = [[NSProcessInfo processInfo] systemUptime];
+        CMTime firstFrameTime = CMTimeMakeWithSeconds(systemNow, 1000000);
+        
+        if(!_recordRequested)
+        {
+            
+            NSLog(@"first frame");
+            NSLog(@"timestamp: %f",CMTimeGetSeconds(timestamp) );
+            NSLog(@"firstFrameTime: %f", CMTimeGetSeconds(firstFrameTime));
+            
+            [self.videoWriter startSessionAtSourceTime:(firstFrameTime)];
+            /*
+             
+             NSTimeInterval  firstFrameTimestamp = [[NSProcessInfo processInfo] systemUptime];
+             NSDate * now = [NSDate date];
+            NSDateFormatter *outputFormatter = [[NSDateFormatter alloc] init];
+            [outputFormatter setDateFormat:@"HH:mm:ss.SSS"];
+            NSString *newDateString = [outputFormatter stringFromDate:now];
+            NSLog(@"first frame: %@", newDateString);
+            
+            NSDate* newDate = [firstFrameTimestamp dateByAddingTimeInterval:timestamp];
+            NSString *intervalString = [NSString stringWithFormat:@"%f", firstFrameTimestamp];
+            NSDate * now = [NSDate date];
+            NSDateFormatter *outputFormatter = [[NSDateFormatter alloc] init];
+            [outputFormatter setDateFormat:@"HH:mm:ss.SSS"];
+            NSString *newDateString = [outputFormatter stringFromDate:now];
+            NSLog(@"native didFinishRecordingToOutputFileAtURL: %@", newDateString);
+            NSLog(@"%lld", timestamp.epoch);*/
+            _recordRequested = YES;
+            
+        }
+        if(self.videoInputWriter.isReadyForMoreMediaData)
+        {
+            [self.videoInputWriter appendSampleBuffer:sampleBuffer];
+            
+            /*
+            NSLog(@"%f", CMTimeGetSeconds(timestamp));
+            NSLog(@"%lld", timestamp.epoch);*/
+        
+        }
+        
+    }
+	
+	  
+}
 - (void)captureOutput:(AVCaptureFileOutput *)captureOutput didFinishRecordingToOutputFileAtURL:(NSURL *)outputFileURL fromConnections:(NSArray *)connections error:(NSError *)error
 {
+
     BOOL success = YES;
     if ([error code] != noErr) {
         NSNumber *value = [[error userInfo] objectForKey:AVErrorRecordingSuccessfullyFinishedKey];
@@ -1855,7 +1956,7 @@ BOOL _sessionInterrupted = NO;
     self.isRecordingInterrupted = NO;
 
     if ([self.textDetector isRealDetector] || [self.faceDetector isRealDetector]) {
-        [self cleanupMovieFileCapture];
+        [self stopBufferCapture];
     }
 
     if ([self.textDetector isRealDetector]) {
@@ -2095,10 +2196,12 @@ BOOL _sessionInterrupted = NO;
 
 # pragma mark - mlkit
 
-- (void)captureOutput:(AVCaptureOutput *)captureOutput
+/*- (void)captureOutput:(AVCaptureOutput *)captureOutput
     didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
            fromConnection:(AVCaptureConnection *)connection
 {
+	CMTime timestamp = CMSampleBufferGetPresentationTimeStamp( sampleBuffer );
+NSLog(@"%lld", timestamp.value);
     if (![self.textDetector isRealDetector] && ![self.faceDetector isRealDetector] && ![self.barcodeDetector isRealDetector]) {
         NSLog(@"failing real check");
         return;
@@ -2154,11 +2257,10 @@ BOOL _sessionInterrupted = NO;
             }];
         }
     }
-}
+}*/
 
 - (bool)isRecording {
     return self.movieFileOutput != nil ? self.movieFileOutput.isRecording : NO;
 }
 
 @end
-
